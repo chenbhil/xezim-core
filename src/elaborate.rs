@@ -11252,6 +11252,25 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
     Ok(())
 }
 
+/// §27.5/§13.4.3 (bug 29): a generate-if/-case condition may legitimately be a
+/// user CONSTANT-FUNCTION call — `if (has_neighbor(r, dir))`. `is_const_expr`
+/// answers `false` for a Call and `eval_const_expr` folds it to 0, so without
+/// this the condition silently reads 0 and the else/boundary branch is taken
+/// for every iteration (a fully disconnected mesh). Fold any const-fn calls to
+/// literals first via the same machinery parameter initializers already use;
+/// returns the folded, call-free expression, or None to fall back to `expr`
+/// unchanged (preserving the prior error/deferral behavior).
+fn fold_const_fn_in_generate(expr: &Expression, elab: &ElaboratedModule) -> Option<Expression> {
+    if !expr_has_call(expr) {
+        return None;
+    }
+    let folded = substitute_const_fn_calls(expr, &elab.parameters, elab, 0)?;
+    if expr_has_call(&folded) {
+        return None;
+    }
+    Some(folded)
+}
+
 /// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
 fn elaborate_generate_if(gi: &GenerateIf, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
     // §27.6: a LABELED branch is a scope — rename its declarations to their
@@ -11274,10 +11293,12 @@ fn elaborate_generate_if(gi: &GenerateIf, elab: &mut ElaboratedModule, all_defs:
     for (bi, (cond, items)) in gi.branches.iter().enumerate() {
         match cond {
             Some(c) => {
-                if !is_const_expr(c, &elab.parameters) {
+                let folded = fold_const_fn_in_generate(c, elab);
+                let ce: &Expression = folded.as_ref().unwrap_or(c);
+                if !is_const_expr(ce, &elab.parameters) {
                     return Err("Generate if condition must be a constant expression".to_string());
                 }
-                let val = eval_const_expr(c, &elab.parameters);
+                let val = eval_const_expr(ce, &elab.parameters);
                 if val != 0 {
                     return take_branch(bi, items, elab);
                 }
@@ -11292,18 +11313,24 @@ fn elaborate_generate_if(gi: &GenerateIf, elab: &mut ElaboratedModule, all_defs:
 }
 
 fn elaborate_generate_case(gc: &GenerateCase, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
-    if !is_const_expr(&gc.selector, &elab.parameters) {
+    // bug 29: fold user const-fn calls in the selector/values, see
+    // fold_const_fn_in_generate.
+    let sel_folded = fold_const_fn_in_generate(&gc.selector, elab);
+    let sel_expr: &Expression = sel_folded.as_ref().unwrap_or(&gc.selector);
+    if !is_const_expr(sel_expr, &elab.parameters) {
         return Err("Generate case selector must be a constant expression".to_string());
     }
-    let sel = eval_const_expr(&gc.selector, &elab.parameters);
+    let sel = eval_const_expr(sel_expr, &elab.parameters);
     // First pass: try to match a non-default arm.
     for arm in &gc.arms {
         if arm.values.is_empty() { continue; } // skip default in this pass
         for v in &arm.values {
-            if !is_const_expr(v, &elab.parameters) {
+            let v_folded = fold_const_fn_in_generate(v, elab);
+            let ve: &Expression = v_folded.as_ref().unwrap_or(v);
+            if !is_const_expr(ve, &elab.parameters) {
                 return Err("Generate case value must be a constant expression".to_string());
             }
-            if eval_const_expr(v, &elab.parameters) == sel {
+            if eval_const_expr(ve, &elab.parameters) == sel {
                 return elaborate_generate_case_arm(arm, elab, all_defs);
             }
         }
@@ -17008,6 +17035,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 Value::zero(((hi - lo + 1).max(1)) as u32)
             }
         }
+        // §13.4.3: a user constant-function call in a value-producing const
+        // context (e.g. a struct assignment pattern field, an array dimension).
+        // Delegate to the i64 evaluator which handles user const-fn calls via
+        // FUNCS_TLS; the caller resizes to the target member width.
+        ExprKind::Call { .. } => {
+            const_eval_i64_with_params(expr, Some(params))
+                .map(|v| Value::from_u64(v as u64, 32))
+                .unwrap_or_else(|| Value::zero(32))
+        }
         _ => Value::zero(32),
     };
     // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
@@ -19484,6 +19520,22 @@ fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>
     collect_effective_items_scoped(items, params, &mut gen_ordinal)
 }
 
+/// §27.5 (bug 29): evaluate a generate-if condition / generate-case selector or
+/// value that may be a user CONSTANT-FUNCTION call (`if (has_neighbor(r,dir))`).
+/// `eval_const_expr` cannot fold a Call and reads it as 0, silently taking the
+/// else/default branch. `const_eval_i64_with_params` DOES fold a user const-fn
+/// call, via the FUNCS_TLS function table set on the elaboration/inlining path.
+/// Route expressions that contain a call through it; fall back to
+/// `eval_const_expr` for everything else so no existing const condition changes.
+fn eval_generate_const(expr: &Expression, params: &HashMap<String, Value>) -> i64 {
+    if expr_has_call(expr) {
+        if let Some(v) = const_eval_i64_with_params(expr, Some(params)) {
+            return v;
+        }
+    }
+    eval_const_expr(expr, params) as i64
+}
+
 fn collect_effective_items_scoped(items: &[ModuleItem], params: &HashMap<String, Value>, gen_ordinal: &mut u32) -> Vec<ModuleItem> {
     let mut result = Vec::new();
     for item in items {
@@ -19498,7 +19550,7 @@ fn collect_effective_items_scoped(items: &[ModuleItem], params: &HashMap<String,
                 let mut matched = false;
                 for (bi, (cond, branch_items)) in gi.branches.iter().enumerate() {
                     let take = match cond {
-                        Some(cond_expr) => eval_const_expr(cond_expr, params) != 0,
+                        Some(cond_expr) => eval_generate_const(cond_expr, params) != 0,
                         None => true, // unconditional else branch
                     };
                     if take {
@@ -19529,12 +19581,12 @@ fn collect_effective_items_scoped(items: &[ModuleItem], params: &HashMap<String,
             }
             ModuleItem::GenerateCase(gc) => {
                 *gen_ordinal += 1;
-                let sel = eval_const_expr(&gc.selector, params);
+                let sel = eval_generate_const(&gc.selector, params);
                 let mut chosen: Option<&GenerateCaseArm> = None;
                 // First pass: try non-default arms.
                 for arm in &gc.arms {
                     if arm.values.is_empty() { continue; }
-                    if arm.values.iter().any(|v| eval_const_expr(v, params) == sel) {
+                    if arm.values.iter().any(|v| eval_generate_const(v, params) == sel) {
                         chosen = Some(arm);
                         break;
                     }
@@ -22129,7 +22181,21 @@ fn inline_module_items(
                                                 } else {
                                                     init
                                                 };
-                                                let mut val = eval_const_expr_val(init, local_map);
+                                                // §6.20: a struct-typed body localparam with
+                                                // an assignment-pattern init. `eval_const_expr_val`
+                                                // has no AssignmentPattern arm and returns 0;
+                                                // `pack_struct_const_value` packs field values
+                                                // field-by-field (the ExprKind::Call arm in
+                                                // eval_const_expr_val then handles const-fn calls
+                                                // in field positions, e.g. `'{x: f(r)}`).
+                                                let mut val = pack_struct_const_value(
+                                                    data_type, init, local_map,
+                                                    &elab_ro.typedefs, &elab_ro.typedef_types)
+                                                    .map(|sv| {
+                                                        let w = resolve_type_width(data_type, Some(local_map), Some(&elab_ro.typedefs)).max(1);
+                                                        sv.resize(w)
+                                                    })
+                                                    .unwrap_or_else(|| eval_const_expr_val(init, local_map));
                                                 if is_type_real(data_type) {
                                                     val = Value::from_f64(val.to_f64());
                                                 } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
